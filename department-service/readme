@@ -1,0 +1,4 @@
+mvn clean package
+docker build -t department:1.7 .
+docker tag department:1.7 guharoytamajit/department:1.7
+docker push guharoytamajit/department:1.7

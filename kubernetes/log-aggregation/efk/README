@@ -1,0 +1,301 @@
+First read :  https://kubernetes.io/docs/concepts/cluster-administration/logging/
+
+>kubectl create -f 01.kube-logging.yaml   #create namespace called kube-logging for efk components
+--------------
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: kube-logging
+--------------
+>kubectl get namespaces
+============================================================================================================================
+create a headless Kubernetes service called elasticsearch that will define a DNS domain for the 3 Pods.
+we define ports 9200 and 9300 which are used to interact with the REST API, and for inter-node communication, respectively.
+>kubectl create -f 02.elasticsearch_svc.yaml
+--------------
+kind: Service
+apiVersion: v1
+metadata:
+  name: elasticsearch
+  namespace: kube-logging
+  labels:
+    app: elasticsearch
+spec:
+  selector:
+    app: elasticsearch
+  clusterIP: None
+  ports:
+    - port: 9200
+      name: rest
+    - port: 9300
+      name: inter-node
+--------------
+>kubectl get services --namespace=kube-logging
+
+==============================================================================================================================
+
+>kubectl create -f 03.elasticsearch_statefulset.yaml
+--------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: es-cluster
+  namespace: kube-logging
+spec:
+  serviceName: elasticsearch          #associate it with our previously created elasticsearch Service
+#This ensures that each Pod in the StatefulSet will be accessible using the following DNS address: es-cluster-[0,1,2].elasticsearch.kube-logging.svc.cluster.local
+  replicas: 3
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.2.0   #Elasticsearch 7.2.0
+        resources:
+            limits:
+              cpu: 1000m
+            requests:
+              cpu: 100m
+        ports:
+        - containerPort: 9200
+          name: rest
+          protocol: TCP
+        - containerPort: 9300
+          name: inter-node
+          protocol: TCP
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+        env:
+          - name: cluster.name
+            value: k8s-logs
+          - name: node.name
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name   #This will resolve to es-cluster-[0,1,2]
+          - name: discovery.seed_hosts
+            value: "es-cluster-0.elasticsearch,es-cluster-1.elasticsearch,es-cluster-2.elasticsearch"
+          - name: cluster.initial_master_nodes
+            value: "es-cluster-0,es-cluster-1,es-cluster-2"
+          - name: ES_JAVA_OPTS
+            value: "-Xms512m -Xmx512m"
+#These Init Containers each run to completion in the order they are defined
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /usr/share/elasticsearch/data"]  #Elasticsearch user’s UID is 1000,By default K8s mounts the data directory as root,which renders it inaccessible to ES.
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: data
+          mountPath: /usr/share/elasticsearch/data
+      - name: increase-vm-max-map                           #increase the operating system’s limits on mmap counts, which by default may be too low, resulting in out of memory errors. 
+        image: busybox
+        command: ["sysctl", "-w", "vm.max_map_count=262144"]
+        securityContext:
+          privileged: true
+      - name: increase-fd-ulimit                           #increase the maximum number of open file descriptors
+        image: busybox
+        command: ["sh", "-c", "ulimit -n 65536"]
+        securityContext:
+          privileged: true
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app: elasticsearch
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: managed-nfs-storage
+      resources:
+        requests:
+          storage: 100Gi
+--------------
+>kubectl rollout status sts/es-cluster --namespace=kube-logging  #monitor the StatefulSet as it is rolled out 
+
+>kubectl port-forward es-cluster-0 9200:9200 --namespace=kube-logging  #node forwarding on one of the pod
+>curl http://localhost:9200/_cluster/state?pretty
+
+==================================================================================================================================
+
+>kubectl create -f 04.kibana.yaml
+
+
+
+----------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: kube-logging
+  labels:
+    app: kibana
+spec:
+  ports:
+  - port: 5601
+  selector:
+    app: kibana
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: kube-logging
+  labels:
+    app: kibana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+      - name: kibana
+        image: docker.elastic.co/kibana/kibana:7.2.0
+        resources:
+          limits:
+            cpu: 1000m
+          requests:
+            cpu: 100m
+        env:
+          - name: ELASTICSEARCH_URL
+            value: http://elasticsearch:9200  #this endpoint corresponds to its Service name elasticsearch. This domain will resolve to a list of IP addresses for the 3 Elasticsearch Pods.
+        ports:
+        - containerPort: 5601
+-----------------
+
+>kubectl rollout status deployment/kibana --namespace=kube-logging
+
+==========================================================================================================================================
+>kubectl get pods --namespace=kube-logging
+NAME                      READY     STATUS    RESTARTS   AGE
+es-cluster-0              1/1       Running   0          55m
+es-cluster-1              1/1       Running   0          54m
+es-cluster-2              1/1       Running   0          54m
+kibana-6c9fb4b5b7-plbg2   1/1       Running   0          4m27s
+
+>kubectl port-forward kibana-6c9fb4b5b7-plbg2 5601:5601 --namespace=kube-logging
+
+hit http://localhost:5601
+
+===========================================================================================================================================
+set up Fluentd as a DaemonSet, which is a Kubernetes workload type that runs a copy of a given Pod on each Node in the Kubernetes cluster. 
+Using this DaemonSet controller, we’ll roll out a Fluentd logging agent Pod on every node in our cluster.
+
+In Kubernetes, containerized applications that log to stdout and stderr have their log streams captured and redirected to JSON files on the nodes. The Fluentd Pod will tail these log files, filter log events, transform the log data, and ship it off to the Elasticsearch 
+see: 
+https://kubernetes.io/docs/concepts/cluster-administration/logging/#using-a-node-logging-agent
+https://kubernetes.io/docs/concepts/cluster-administration/logging/
+https://kubernetes.io/docs/tasks/debug-application-cluster/audit/
+
+In addition to container logs, the Fluentd agent will tail Kubernetes system component logs like kubelet, kube-proxy, and Docker logs. To see a full list of sources tailed by the Fluentd logging agent, consult the kubernetes.conf file used to configure the logging agent. To learn more about logging in Kubernetes clusters, consult “Logging at the node level” from the official Kubernetes documentation.
+
+>kubectl create -f 05.fluentd.yaml
+
+-----------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+  labels:
+    app: fluentd
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd
+roleRef:
+  kind: ClusterRole
+  name: fluentd
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+- kind: ServiceAccount
+  name: fluentd
+  namespace: kube-logging
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccount: fluentd
+      serviceAccountName: fluentd
+#This will ensure that the DaemonSet also gets rolled out to the Kubernetes masters. If you don’t want to run a Fluentd Pod on your master nodes, remove this toleration. 
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: fluentd
+        image: fluent/fluentd-kubernetes-daemonset:v1.4.2-debian-elasticsearch-1.1
+        env:
+          - name:  FLUENT_ELASTICSEARCH_HOST
+            value: "elasticsearch.kube-logging.svc.cluster.local"   #This will resolve to a list of IP addresses for the 3 Elasticsearch Pods
+          - name:  FLUENT_ELASTICSEARCH_PORT
+            value: "9200"
+          - name: FLUENT_ELASTICSEARCH_SCHEME
+            value: "http"
+          - name: FLUENTD_SYSTEMD_CONF
+            value: disable
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+-------------------------------
+>kubectl get ds --namespace=kube-logging
+
+==================================================================================================
+
